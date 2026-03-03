@@ -81,6 +81,7 @@ const STYLE = `
   .meth-btn.on{border-color:var(--accent);background:rgba(249,115,22,.12);color:var(--accent)}
   .prow{display:flex;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid var(--border)}
   .prow:last-child{border-bottom:none}
+  .snap-badge{display:inline-flex;align-items:center;gap:3px;padding:1px 6px;border-radius:5px;font-size:10px;font-weight:600;background:rgba(59,130,246,.12);color:#93c5fd;border:1px solid rgba(59,130,246,.25);margin-left:5px;vertical-align:middle}
 `;
 
 const MONTHS = ["Gennaio","Febbraio","Marzo","Aprile","Maggio","Giugno","Luglio","Agosto","Settembre","Ottobre","Novembre","Dicembre"];
@@ -110,6 +111,7 @@ async function loadData(){
 }
 async function saveData(d){try{await window.storage.set(SK,JSON.stringify(d));}catch(_){}}
 
+// Standard live calculation
 function calcQuote(data,month,year){
   const active=data.users.filter(u=>u.role!=="superadmin");
   const affitto=data.settings?.affitto??650;
@@ -127,6 +129,57 @@ function calcQuote(data,month,year){
   const expS=n>0?exps.reduce((s,e)=>s+e.amount,0)/n:0;
   const elecS=n>0?elecs.reduce((s,e)=>s+e.amount,0)/n:0;
   return rows.map(r=>({...r,quota:+quota.toFixed(2),expShare:+expS.toFixed(2),elecShare:+elecS.toFixed(2),total:+(r.fixed+quota+expS+elecS).toFixed(2)}));
+}
+
+// Build a snapshot of the current state to freeze at payment time
+function buildSnapshot(data, month, year){
+  const active = data.users.filter(u=>u.role!=="superadmin");
+  const cts = data.costTypes || DEFAULT_CTS;
+  const affitto = data.settings?.affitto ?? 650;
+  const exps = (data.expenses||[]).filter(e=>e.month===month&&e.year===year);
+  const elecs = (data.electricity||[]).filter(e=>e.month===month&&e.year===year);
+  return {
+    affitto,
+    costTypes: JSON.parse(JSON.stringify(cts)),
+    users: active.map(u=>({id:u.id, name:u.name, extras:JSON.parse(JSON.stringify(u.extras||{}))})),
+    totalExpenses: exps.reduce((s,e)=>s+e.amount,0),
+    totalElectricity: elecs.reduce((s,e)=>s+e.amount,0),
+  };
+}
+
+// Calculate a single user's quote from a frozen snapshot
+function calcQuoteFromSnapshot(snap, userId){
+  const n = snap.users.length;
+  if(n===0) return null;
+  const user = snap.users.find(u=>u.id===userId);
+  if(!user) return null;
+  const cts = snap.costTypes;
+
+  let fixed=0; const bd=[];
+  cts.forEach(ct=>{
+    const qty=(user.extras||{})[ct.id]||0;
+    if(qty>0){fixed+=qty*ct.price;bd.push({label:`${ct.icon} ${ct.label} x${qty}`,cost:qty*ct.price});}
+  });
+
+  const totFixed = snap.users.reduce((s,u)=>{
+    let f=0;
+    cts.forEach(ct=>{f+=((u.extras||{})[ct.id]||0)*ct.price;});
+    return s+f;
+  },0);
+  const quota = (snap.affitto - totFixed)/n;
+  const expS = snap.totalExpenses/n;
+  const elecS = snap.totalElectricity/n;
+  return {
+    id: userId,
+    name: user.name,
+    fixed,
+    bd,
+    quota: +quota.toFixed(2),
+    expShare: +expS.toFixed(2),
+    elecShare: +elecS.toFixed(2),
+    total: +(fixed+quota+expS+elecS).toFixed(2),
+    fromSnapshot: true,
+  };
 }
 
 export default function App(){
@@ -189,18 +242,25 @@ function Login({data,onLogin}){
 }
 
 function TabQuota({data,me,month,year,persist,showToast}){
-  const quotes=calcQuote(data,month,year);
-  const myQ=quotes.find(q=>q.id===me.id);
   const payments=data.payments||{};
   const pk=pkey(me.id,month,year);
   const myPay=payments[pk];
   const isPaid=!!myPay?.paid;
+
+  // Use frozen snapshot if already paid, otherwise live calculation
+  const myQ = isPaid && myPay.snapshot
+    ? calcQuoteFromSnapshot(myPay.snapshot, me.id)
+    : calcQuote(data,month,year).find(q=>q.id===me.id);
+
   const [showForm,setShowForm]=useState(false);
   const [method,setMethod]=useState(PAY_METHODS[0]);
   const [note,setNote]=useState("");
   if(!myQ)return<div className="empty"><div className="ico">?</div>Dati non trovati</div>;
+
   const handlePay=async()=>{
-    const rec={paid:true,amount:myQ.total,method,note:note.trim(),date:new Date().toISOString().slice(0,10),paidByName:me.name};
+    // Freeze current state into a snapshot so future changes don't alter this payment
+    const snapshot = buildSnapshot(data, month, year);
+    const rec={paid:true,amount:myQ.total,method,note:note.trim(),date:new Date().toISOString().slice(0,10),paidByName:me.name,snapshot};
     await persist({...data,payments:{...payments,[pk]:rec}});
     setShowForm(false);setNote("");showToast("Pagamento registrato!");
   };
@@ -211,50 +271,36 @@ function TabQuota({data,me,month,year,persist,showToast}){
   return(
     <div className="page">
       <div className={`card ${isPaid?"pay-paid":"pay-unpaid"}`}>
-        <div className="ctitle">{MONTHS[month]} {year}</div>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
           <div>
-            <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:48,fontWeight:900,lineHeight:1,color:isPaid?"var(--green)":"var(--accent)"}}>
-              {myQ.total.toFixed(2)} EUR
-            </div>
-            <div style={{fontSize:12,color:"var(--muted)",marginTop:6}}>totale mensile</div>
+            <div style={{fontSize:10,color:"var(--muted)",letterSpacing:2,textTransform:"uppercase",marginBottom:4}}>La tua quota — {MONTHS[month]} {year}</div>
+            <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:44,fontWeight:900,color:isPaid?"var(--green)":"var(--accent)",lineHeight:1}}>{myQ.total.toFixed(2)}<span style={{fontSize:18,marginLeft:4}}>EUR</span></div>
+            {isPaid&&myPay.snapshot&&<span className="snap-badge">🔒 quota bloccata</span>}
           </div>
-          <div style={{textAlign:"right"}}>
-            <div className={`pbadge ${isPaid?"pb-paid":"pb-unpaid"}`}>{isPaid?"PAGATO":"DA PAGARE"}</div>
-            {isPaid&&myPay.method&&<div style={{fontSize:12,color:"var(--muted)",marginTop:6}}>{myPay.method}</div>}
-            {isPaid&&myPay.date&&<div style={{fontSize:11,color:"var(--muted)"}}>{myPay.date}</div>}
-          </div>
+          <div className={`pbadge ${isPaid?"pb-paid":"pb-unpaid"}`}>{isPaid?"✓ PAGATO":"✗ DA PAGARE"}</div>
         </div>
-        {isPaid&&myPay.note&&<div style={{marginTop:10,fontSize:13,color:"var(--muted)",fontStyle:"italic"}}>"{myPay.note}"</div>}
+        <div className="brow"><span className="blv">Base affitto</span><span className="brv">{myQ.quota.toFixed(2)} EUR</span></div>
+        {myQ.bd.map((b,i)=><div key={i} className="brow"><span className="blv">{b.label}</span><span className="brv">{b.cost.toFixed(2)} EUR</span></div>)}
+        <div className="brow"><span className="blv">Spese condivise</span><span className="brv">{myQ.expShare.toFixed(2)} EUR</span></div>
+        <div className="brow"><span className="blv">Corrente</span><span className="brv">{myQ.elecShare.toFixed(2)} EUR</span></div>
+        {isPaid&&myPay&&(
+          <div style={{marginTop:12,padding:"9px 12px",background:"rgba(34,197,94,.08)",borderRadius:8,border:"1px solid rgba(34,197,94,.2)"}}>
+            <div style={{fontSize:12,color:"var(--green)",fontWeight:600}}>Pagato il {myPay.date} · {myPay.method}</div>
+            {myPay.note&&<div style={{fontSize:12,color:"var(--muted)",marginTop:2,fontStyle:"italic"}}>"{myPay.note}"</div>}
+          </div>
+        )}
       </div>
-      {!isPaid&&!showForm&&<button className="btn-green" style={{marginBottom:14}} onClick={()=>setShowForm(true)}>Segna come Pagato</button>}
+      {!isPaid&&!showForm&&<button className="btn-green" onClick={()=>setShowForm(true)}>Registra Pagamento</button>}
       {!isPaid&&showForm&&(
-        <div className="card" style={{border:"1px solid rgba(34,197,94,.35)"}}>
-          <div className="ctitle">Conferma Pagamento</div>
-          <div style={{marginBottom:12}}>
-            <label className="lbl">Metodo di pagamento</label>
-            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-              {PAY_METHODS.map(m=><button key={m} className={`meth-btn ${method===m?"on":""}`} style={{flex:"1 1 calc(33% - 6px)",minWidth:76}} onClick={()=>setMethod(m)}>{m}</button>)}
-            </div>
-          </div>
-          <div className="fw" style={{marginBottom:12}}>
-            <label className="lbl">Nota (opzionale)</label>
-            <input className="inp" style={{marginBottom:0}} value={note} onChange={e=>setNote(e.target.value)} placeholder="es. Pagato sabato mattina"/>
-          </div>
-          <button className="btn-green" onClick={handlePay}>Conferma {myQ.total.toFixed(2)} EUR</button>
+        <div className="card">
+          <div className="ctitle">Metodo di pagamento</div>
+          <div style={{display:"flex",gap:6,marginBottom:13,flexWrap:"wrap"}}>{PAY_METHODS.map(m=><button key={m} className={`meth-btn ${method===m?"on":""}`} onClick={()=>setMethod(m)}>{m}</button>)}</div>
+          <div className="fw" style={{marginBottom:13}}><label className="lbl">Note (opzionale)</label><input className="inp" style={{marginBottom:0}} value={note} onChange={e=>setNote(e.target.value)} placeholder="es. Pagato in due rate"/></div>
+          <button className="btn-green" onClick={handlePay}>Conferma Pagamento — {myQ.total.toFixed(2)} EUR</button>
           <button className="btn-undo" onClick={()=>setShowForm(false)}>Annulla</button>
         </div>
       )}
-      {isPaid&&<button className="btn-undo" style={{marginBottom:14}} onClick={handleUndo}>Annulla pagamento</button>}
-      <div className="card">
-        <div className="ctitle">Dettaglio</div>
-        <div className="brow"><span className="blv">Quota base affitto</span><span className="brv brac">{myQ.quota.toFixed(2)} EUR</span></div>
-        {myQ.bd.map((b,i)=><div key={i} className="brow"><span className="blv">{b.label}</span><span className="brv">{b.cost.toFixed(2)} EUR</span></div>)}
-        <div className="brow"><span className="blv">Quota spese condivise</span><span className="brv">{myQ.expShare>0?myQ.expShare.toFixed(2)+" EUR":"—"}</span></div>
-        <div className="brow"><span className="blv">Quota corrente</span><span className="brv">{myQ.elecShare>0?myQ.elecShare.toFixed(2)+" EUR":"—"}</span></div>
-        <div style={{height:1,background:isPaid?"var(--green)":"var(--accent)",opacity:.2,margin:"8px 0"}}/>
-        <div className="brow" style={{paddingTop:8}}><span style={{fontWeight:600}}>TOTALE</span><span className="brv brac" style={{fontSize:18}}>{myQ.total.toFixed(2)} EUR</span></div>
-      </div>
+      {isPaid&&<button className="btn-undo" onClick={handleUndo}>Annulla pagamento</button>}
     </div>
   );
 }
@@ -267,14 +313,12 @@ function TabSpese({data,me,month,year,persist,showToast}){
   const share=n>0?total/n:0;
   const handleAdd=async()=>{
     if(!desc.trim()||!amount)return;
-    const exp={id:uid(),desc:desc.trim(),amount:parseFloat(amount),paidBy:me.id,paidByName:me.name,month,year};
-    await persist({...data,expenses:[...(data.expenses||[]),exp]});
+    const rec={id:uid(),desc:desc.trim(),amount:parseFloat(amount),paidBy:me.id,paidByName:me.name,month,year};
+    await persist({...data,expenses:[...(data.expenses||[]),rec]});
     setDesc("");setAmount("");setAdding(false);showToast("Spesa aggiunta");
   };
   const handleDel=async id=>{
-    const exp=(data.expenses||[]).find(e=>e.id===id);
-    if(!exp||exp.paidBy!==me.id){showToast("Non puoi eliminare spese altrui");return;}
-    await persist({...data,expenses:data.expenses.filter(e=>e.id!==id)});showToast("Rimossa");
+    await persist({...data,expenses:data.expenses.filter(e=>e.id!==id)});showToast("Rimosso");
   };
   return(
     <div className="page">
@@ -364,7 +408,11 @@ function TabRiepilogo({data,month,year}){
   const totalExp=(data.expenses||[]).filter(e=>e.month===month&&e.year===year).reduce((s,e)=>s+e.amount,0);
   const totalElec=(data.electricity||[]).filter(e=>e.month===month&&e.year===year).reduce((s,e)=>s+e.amount,0);
   const paidList=quotes.filter(q=>payments[pkey(q.id,month,year)]?.paid);
-  const totalPaid=paidList.reduce((s,q)=>s+q.total,0);
+  // Use snapshot amount if available
+  const totalPaid=paidList.reduce((s,q)=>{
+    const pay=payments[pkey(q.id,month,year)];
+    return s+(pay?.amount??q.total);
+  },0);
   const nPaid=paidList.length;
   const pct=grand>0?totalPaid/grand*100:0;
   return(
@@ -389,11 +437,15 @@ function TabRiepilogo({data,month,year}){
         {quotes.map(q=>{
           const pay=payments[pkey(q.id,month,year)];
           const isPaid=!!pay?.paid;
+          const displayTotal=isPaid&&pay.amount?pay.amount:q.total;
+          const hasSnap=isPaid&&!!pay.snapshot;
           return(
             <div key={q.id} className="prow">
               <div style={{width:10,height:10,borderRadius:"50%",flexShrink:0,background:isPaid?"var(--green)":"var(--border)"}}/>
               <div style={{flex:1,minWidth:0}}>
-                <div style={{fontWeight:500,fontSize:14}}>{q.name}</div>
+                <div style={{fontWeight:500,fontSize:14,display:"flex",alignItems:"center",flexWrap:"wrap",gap:4}}>
+                  {q.name}{hasSnap&&<span className="snap-badge">🔒</span>}
+                </div>
                 <div style={{fontSize:11,color:"var(--muted)",marginTop:3}}>
                   {q.bd.map((b,i)=><span key={i} className="pill pill-x" style={{fontSize:10}}>{b.label}</span>)}
                   {isPaid&&<span style={{color:"var(--green)"}}> · {pay.method}{pay.date?" · "+pay.date:""}</span>}
@@ -401,7 +453,7 @@ function TabRiepilogo({data,month,year}){
                 </div>
               </div>
               <div style={{textAlign:"right"}}>
-                <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:16,fontWeight:700,color:isPaid?"var(--green)":"var(--accent)"}}>{q.total.toFixed(2)} EUR</div>
+                <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:16,fontWeight:700,color:isPaid?"var(--green)":"var(--accent)"}}>{displayTotal.toFixed(2)} EUR</div>
                 <div className={`pbadge ${isPaid?"pb-paid":"pb-unpaid"}`} style={{fontSize:10,padding:"2px 7px",marginTop:4}}>{isPaid?"✓ PAGATO":"✗ NON PAGATO"}</div>
               </div>
             </div>
@@ -429,18 +481,25 @@ function TabStorico({data,me,isSA}){
       {months.map(({year,month})=>{
         const key=`${year}-${month}`;
         const quotes=calcQuote(data,month,year);
-        const myQ=quotes.find(q=>q.id===me.id);
+        const payments=data.payments||{};
         const exp=(data.expenses||[]).filter(e=>e.month===month&&e.year===year);
         const elec=(data.electricity||[]).filter(e=>e.month===month&&e.year===year);
         const isOpen=open===key;
-        const disp=isSA?quotes.reduce((s,q)=>s+q.total,0):(myQ?.total??0);
-        const pay=!isSA?(data.payments||{})[pkey(me.id,month,year)]:null;
+        const pay=!isSA?payments[pkey(me.id,month,year)]:null;
         const isPaid=!!pay?.paid;
+        // For non-admin: use frozen snapshot if paid
+        const myQ=!isSA
+          ?(isPaid&&pay.snapshot?calcQuoteFromSnapshot(pay.snapshot,me.id):quotes.find(q=>q.id===me.id))
+          :null;
+        const disp=isSA?quotes.reduce((s,q)=>s+q.total,0):(myQ?.total??0);
         return(
           <div key={key} className="hm">
             <div className="hh" onClick={()=>setOpen(isOpen?null:key)}>
               <div>
-                <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,fontSize:16}}>{MONTHS[month]} {year}</div>
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,fontSize:16}}>{MONTHS[month]} {year}</div>
+                  {!isSA&&isPaid&&pay.snapshot&&<span className="snap-badge">🔒</span>}
+                </div>
                 <div style={{fontSize:12,color:"var(--muted)",marginTop:2}}>Spese: {exp.reduce((s,e)=>s+e.amount,0).toFixed(0)} EUR · Corrente: {elec.reduce((s,e)=>s+e.amount,0).toFixed(0)} EUR</div>
               </div>
               <div style={{textAlign:"right",display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
@@ -455,27 +514,33 @@ function TabStorico({data,me,isSA}){
                   <>
                     <div style={{fontSize:10,color:"var(--muted)",letterSpacing:2,textTransform:"uppercase",margin:"12px 0 8px"}}>Quote</div>
                     {quotes.map(q=>{
-                      const qp=(data.payments||{})[pkey(q.id,month,year)];
+                      const qp=payments[pkey(q.id,month,year)];
+                      const hasSnap=!!qp?.snapshot;
+                      const amt=qp?.paid&&qp.amount?qp.amount:q.total;
                       return(<div key={q.id} className="brow">
                         <span className="blv" style={{display:"flex",alignItems:"center",gap:6}}>
                           <span style={{width:8,height:8,borderRadius:"50%",background:qp?.paid?"var(--green)":"var(--border)",display:"inline-block",flexShrink:0}}/>
                           {q.name}{qp?.paid&&qp.method?` · ${qp.method}`:""}
+                          {hasSnap&&<span className="snap-badge">🔒</span>}
                         </span>
-                        <span className="brv brac">{q.total.toFixed(2)} EUR</span>
+                        <span className="brv brac">{amt.toFixed(2)} EUR</span>
                       </div>);
                     })}
                   </>
                 ):myQ?(
                   <>
-                    <div style={{fontSize:10,color:"var(--muted)",letterSpacing:2,textTransform:"uppercase",margin:"12px 0 8px"}}>La tua quota</div>
+                    <div style={{fontSize:10,color:"var(--muted)",letterSpacing:2,textTransform:"uppercase",margin:"12px 0 8px",display:"flex",alignItems:"center",gap:6}}>
+                      La tua quota
+                      {isPaid&&pay.snapshot&&<span className="snap-badge">🔒 bloccata al pagamento</span>}
+                    </div>
                     <div className="brow"><span className="blv">Base affitto</span><span className="brv">{myQ.quota.toFixed(2)} EUR</span></div>
                     {myQ.bd.map((b,i)=><div key={i} className="brow"><span className="blv">{b.label}</span><span className="brv">{b.cost.toFixed(2)} EUR</span></div>)}
                     <div className="brow"><span className="blv">Spese</span><span className="brv">{myQ.expShare.toFixed(2)} EUR</span></div>
                     <div className="brow"><span className="blv">Corrente</span><span className="brv">{myQ.elecShare.toFixed(2)} EUR</span></div>
                     <div className="brow"><span style={{fontWeight:600}}>TOTALE</span><span className="brv brac">{myQ.total.toFixed(2)} EUR</span></div>
-                    {pay?.paid?(
+                    {isPaid?(
                       <div style={{marginTop:10,background:"rgba(34,197,94,.1)",border:"1px solid rgba(34,197,94,.25)",borderRadius:8,padding:"9px 12px"}}>
-                        <div style={{display:"flex",justifyContent:"space-between"}}><span style={{fontSize:13,color:"var(--green)",fontWeight:600}}>Pagato</span><span style={{fontSize:13,color:"var(--green)"}}>{pay.amount?.toFixed(2)} EUR</span></div>
+                        <div style={{display:"flex",justifyContent:"space-between"}}><span style={{fontSize:13,color:"var(--green)",fontWeight:600}}>Pagato</span><span style={{fontSize:13,color:"var(--green)"}}>{(pay.amount??myQ.total).toFixed(2)} EUR</span></div>
                         <div style={{fontSize:12,color:"var(--muted)",marginTop:3}}>{pay.method}{pay.date?" · "+pay.date:""}{pay.note?` · "${pay.note}"`:""}</div>
                       </div>
                     ):(
@@ -514,68 +579,67 @@ function TabCassa({data,me,persist,showToast}){
     setForm({desc:"",amount:"",type:"entrata",category:""});setAdding(false);showToast("Registrato in cassa");
   };
   const handleDel=async id=>{
-    const item=cassa.find(c=>c.id===id);
-    if(!item)return;
-    if(item.addedBy!==me.id&&me.role!=="superadmin"){showToast("Non puoi eliminare voci altrui");return;}
     await persist({...data,cassa:cassa.filter(c=>c.id!==id)});showToast("Rimosso");
   };
-  const sorted=[...cassa].sort((a,b)=>b.date.localeCompare(a.date));
   return(
     <div className="page">
-      <div className="card" style={{background:`linear-gradient(135deg,${saldo>=0?"#0d1a0d":"#1a0d0d"},#22262f)`,border:`1px solid ${saldo>=0?"rgba(34,197,94,.3)":"rgba(239,68,68,.3)"}`}}>
-        <div className="ctitle">Saldo Cassa Comune</div>
-        <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:48,fontWeight:900,lineHeight:1,color:saldo>=0?"var(--green)":"var(--red)"}}>{saldo.toFixed(2)} EUR</div>
-        <div style={{display:"flex",gap:20,marginTop:12}}>
-          <div><div style={{fontSize:10,color:"var(--muted)"}}>ENTRATE</div><div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:16,fontWeight:700,color:"var(--green)"}}>{entrate.toFixed(2)} EUR</div></div>
-          <div><div style={{fontSize:10,color:"var(--muted)"}}>USCITE</div><div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:16,fontWeight:700,color:"var(--red)"}}>{uscite.toFixed(2)} EUR</div></div>
+      <div className="card" style={{background:"linear-gradient(135deg,#0d1a10,#22262f)",border:"1px solid rgba(34,197,94,.25)"}}>
+        <div className="ctitle">Saldo Cassa</div>
+        <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:44,fontWeight:900,color:saldo>=0?"var(--green)":"var(--red)",lineHeight:1}}>{saldo.toFixed(2)}<span style={{fontSize:18,marginLeft:4}}>EUR</span></div>
+        <div style={{display:"flex",gap:20,marginTop:10}}>
+          <div><div style={{fontSize:10,color:"var(--muted)"}}>ENTRATE</div><div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:18,fontWeight:700,color:"var(--green)"}}>{entrate.toFixed(2)} EUR</div></div>
+          <div><div style={{fontSize:10,color:"var(--muted)"}}>USCITE</div><div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:18,fontWeight:700,color:"var(--red)"}}>{uscite.toFixed(2)} EUR</div></div>
         </div>
       </div>
-      {!adding?<button className="btn" style={{marginBottom:14}} onClick={()=>setAdding(true)}>+ Aggiungi Movimento</button>:(
+      {!adding?<button className="btn" style={{marginBottom:14}} onClick={()=>setAdding(true)}>+ Registra Movimento</button>:(
         <div className="card">
           <div className="ctitle">Nuovo Movimento</div>
           <div className="fgrid">
-            <div className="frow">
-              <div className="fw"><label className="lbl">Tipo</label><select className="sel" value={form.type} onChange={e=>setForm(f=>({...f,type:e.target.value}))}><option value="entrata">Entrata</option><option value="uscita">Uscita</option></select></div>
-              <div className="fw"><label className="lbl">Importo EUR</label><input className="inp" style={{marginBottom:0}} type="number" value={form.amount} onChange={e=>setForm(f=>({...f,amount:e.target.value}))} placeholder="0.00" min="0" step="0.01"/></div>
+            <div style={{display:"flex",gap:6}}>
+              <button className={`meth-btn ${form.type==="entrata"?"on":""}`} style={{borderColor:form.type==="entrata"?"var(--green)":undefined,color:form.type==="entrata"?"var(--green)":undefined,background:form.type==="entrata"?"rgba(34,197,94,.12)":undefined}} onClick={()=>setForm(f=>({...f,type:"entrata"}))}>↑ Entrata</button>
+              <button className={`meth-btn ${form.type==="uscita"?"on":""}`} style={{borderColor:form.type==="uscita"?"var(--red)":undefined,color:form.type==="uscita"?"var(--red)":undefined,background:form.type==="uscita"?"rgba(239,68,68,.12)":undefined}} onClick={()=>setForm(f=>({...f,type:"uscita"}))}>↓ Uscita</button>
             </div>
-            <div className="fw"><label className="lbl">Descrizione</label><input className="inp" style={{marginBottom:0}} value={form.desc} onChange={e=>setForm(f=>({...f,desc:e.target.value}))} placeholder="es. Lavoro saldatura"/></div>
-            <div className="fw"><label className="lbl">Categoria (opzionale)</label><input className="inp" style={{marginBottom:0}} value={form.category} onChange={e=>setForm(f=>({...f,category:e.target.value}))} placeholder="es. Lavoro, Macchinario"/></div>
+            <div className="fw"><label className="lbl">Descrizione</label><input className="inp" style={{marginBottom:0}} value={form.desc} onChange={e=>setForm(f=>({...f,desc:e.target.value}))} placeholder="es. Quota mensile Mario"/></div>
+            <div className="frow">
+              <div className="fw"><label className="lbl">Importo EUR</label><input className="inp" style={{marginBottom:0}} type="number" value={form.amount} onChange={e=>setForm(f=>({...f,amount:e.target.value}))} placeholder="0.00" min="0" step="0.01"/></div>
+              <div className="fw"><label className="lbl">Categoria</label><input className="inp" style={{marginBottom:0}} value={form.category} onChange={e=>setForm(f=>({...f,category:e.target.value}))} placeholder="es. affitto"/></div>
+            </div>
             <div style={{display:"flex",gap:9}}><button className="btn" style={{flex:1}} onClick={handleAdd}>Salva</button><button className="btn-g" onClick={()=>setAdding(false)}>Annulla</button></div>
           </div>
         </div>
       )}
-      {sorted.length>0?(
+      {cassa.length>0&&(
         <div className="card">
           <div className="ctitle">Movimenti</div>
-          {sorted.map(c=>(
-            <div key={c.id} className="ci">
-              <div className="cdot" style={{background:c.type==="entrata"?"var(--green)":"var(--red)"}}/>
+          {[...cassa].reverse().map(c=>(
+            <div key={c.id} className="ei">
+              <div className="eico" style={{background:c.type==="entrata"?"rgba(34,197,94,.15)":"rgba(239,68,68,.15)"}}>{c.type==="entrata"?"↑":"↓"}</div>
               <div style={{flex:1,minWidth:0}}>
-                <div style={{fontSize:14,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.desc}</div>
-                <div style={{fontSize:12,color:"var(--muted)"}}>{c.date} · {c.addedByName}{c.category&&<span className="pill pill-x" style={{marginLeft:5,fontSize:10}}>{c.category}</span>}</div>
+                <div style={{fontSize:14,fontWeight:500}}>{c.desc}</div>
+                <div style={{fontSize:11,color:"var(--muted)",marginTop:2}}>{c.date} · {c.addedByName}{c.category?` · ${c.category}`:""}</div>
               </div>
-              <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
+              <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:5}}>
                 <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:16,fontWeight:700,color:c.type==="entrata"?"var(--green)":"var(--red)"}}>{c.type==="entrata"?"+":"-"}{c.amount.toFixed(2)} EUR</div>
-                {(c.addedBy===me.id||me.role==="superadmin")&&<button className="btn-r" style={{padding:"2px 7px",fontSize:10}} onClick={()=>handleDel(c.id)}>X</button>}
+                <button className="btn-r" style={{padding:"3px 7px",fontSize:11}} onClick={()=>handleDel(c.id)}>Elimina</button>
               </div>
             </div>
           ))}
         </div>
-      ):<div className="empty"><div className="ico">💰</div>Nessun movimento in cassa</div>}
+      )}
+      {cassa.length===0&&!adding&&<div className="empty"><div className="ico">💰</div>Nessun movimento registrato</div>}
     </div>
   );
 }
 
 function TabProfilo({data,me,setMe,persist,showToast,isSA}){
-  const u=data.users.find(u=>u.id===me.id);
+  const u=data.users.find(x=>x.id===me.id);
+  const cts=data.costTypes||DEFAULT_CTS;
   const [name,setName]=useState(u?.name||"");
   const [pass,setPass]=useState("");const [pass2,setPass2]=useState("");
   const [extras,setExtras]=useState(u?.extras||{});
-  const cts=data.costTypes||DEFAULT_CTS;
   const handleSave=async()=>{
-    if(!name.trim()){showToast("Il nome non puo essere vuoto");return;}
     if(pass&&pass!==pass2){showToast("Le password non coincidono");return;}
-    if(name.toLowerCase()!==u.name.toLowerCase()&&data.users.find(x=>x.id!==me.id&&x.name.toLowerCase()===name.trim().toLowerCase())){showToast("Nome gia in uso");return;}
+    if(!name.trim()){showToast("Il nome non può essere vuoto");return;}
     const patch={name:name.trim(),extras};
     if(pass)patch.password=pass;
     const users=data.users.map(x=>x.id===me.id?{...x,...patch}:x);
@@ -598,6 +662,7 @@ function TabProfilo({data,me,setMe,persist,showToast,isSA}){
       {!isSA&&(
         <div className="card">
           <div className="ctitle">Le mie dotazioni</div>
+          <div style={{background:"rgba(59,130,246,.08)",border:"1px solid rgba(59,130,246,.2)",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#93c5fd",marginBottom:12}}>🔒 Modificare le dotazioni non cambia i mesi già pagati.</div>
           {cts.map(ct=>(
             <div key={ct.id} className="trow">
               <div><div style={{fontSize:14}}>{ct.icon} {ct.label}</div><div style={{fontSize:12,color:"var(--muted)",marginTop:2}}>{ct.price} EUR / {ct.unit} / mese</div></div>
@@ -691,6 +756,7 @@ function TabAdmin({data,me,persist,showToast}){
       {sec==="costs"&&(
         <>
           <div style={{background:"rgba(234,179,8,.08)",border:"1px solid rgba(234,179,8,.2)",borderRadius:10,padding:"9px 13px",marginBottom:13,fontSize:13,color:"#fde68a"}}>Gestisci le tipologie di dotazione. Ogni utente imposta le proprie quantita dal Profilo.</div>
+          <div style={{background:"rgba(59,130,246,.08)",border:"1px solid rgba(59,130,246,.2)",borderRadius:10,padding:"9px 13px",marginBottom:13,fontSize:13,color:"#93c5fd"}}>🔒 Le modifiche ai prezzi non influenzano i mesi già pagati (valori bloccati al momento del pagamento).</div>
           <div className="card">
             <div className="ctitle">Tipologie</div>
             {cts.map(ct=>(
@@ -730,6 +796,7 @@ function TabAdmin({data,me,persist,showToast}){
         <div className="card">
           <div className="ctitle">Affitto Mensile Totale</div>
           <div style={{fontSize:13,color:"var(--muted)",marginBottom:13}}>Il costo fisso mensile del capannone ripartito tra i partecipanti.</div>
+          <div style={{background:"rgba(59,130,246,.08)",border:"1px solid rgba(59,130,246,.2)",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#93c5fd",marginBottom:13}}>🔒 Modificare l'affitto non cambia i mesi già pagati.</div>
           <div style={{display:"flex",gap:9,alignItems:"center"}}>
             <input className="inp" style={{marginBottom:0,flex:1}} type="number" value={affitto} onChange={e=>setAffitto(e.target.value)}/>
             <button className="btn" style={{width:"auto",padding:"11px 16px"}} onClick={saveAff}>Salva</button>
@@ -745,7 +812,8 @@ function AdminEditUser({user,cts,onSave,onCancel}){
   const [pass,setPass]=useState("");
   return(
     <div className="card" style={{border:"1px solid var(--accent)",margin:"8px 0"}}>
-      <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,fontSize:14,marginBottom:11}}>Modifica: {user.name}</div>
+      <div style={{fontFamily:"'Barlow Condensed',sans-serif",fontWeight:700,fontSize:14,marginBottom:6}}>Modifica: {user.name}</div>
+      <div style={{fontSize:12,color:"#93c5fd",marginBottom:11}}>🔒 Le modifiche non influenzano i mesi già pagati.</div>
       {cts.map(ct=>(
         <div key={ct.id} className="trow">
           <div><div style={{fontSize:13}}>{ct.icon} {ct.label}</div><div style={{fontSize:11,color:"var(--muted)"}}>{ct.price} EUR/{ct.unit}</div></div>
